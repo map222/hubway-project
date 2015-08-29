@@ -25,6 +25,7 @@ load_trips <- function(trip_filename = 'hubway_trips.csv') {
   }
   trips <- read.csv(trip_filename, stringsAsFactors = FALSE)
   trips$subsc_type <- as.factor(trips$subsc_type)
+  trips$gender <- as.factor(trips$gender)
   
   # get rid of weird trip lengths
   short_trips <- trips$duration < 60 # remove trips shorter than 1 minute, as not likely a real trip
@@ -48,6 +49,10 @@ clean_datetimes_trips <- function(trips) {
   trips$end_date <- as.Date(split_datetimes[,1], format="%m/%d/%Y")
   trips$end_hour <- as.factor( substr(split_datetimes[,2], 1, 2  ) )
   
+  # assign weekday, and weekend vs workweek
+  trips$day_of_week <- weekdays(trips$start_date)
+  trips$weekend <- as.numeric(grepl("Sat|Sun", trips$day_of_week))
+  
   return(trips)
 }
 
@@ -68,7 +73,7 @@ load_stations <- function(stations_filename = 'hubway_stations.csv') {
   
   # load elevation data for each station
   elevation <- raster('IMG_ELEV2005.tif')
-  plot(elevation)
+  #plot(elevation)
   
   # add elevation column to stations info
   stations <- transform(stations, elev = get_elevation(lng, lat, elevation))
@@ -97,8 +102,11 @@ load_weather <- function(weather_filename = 'boston_weather.csv') {
   # rename 'date' for compatability with other data.tables
   setnames(weather_data, 'date', 'start_date')
   
-  # remove nonsense data
+  # remove or replace nonsense data
   weather_data <- weather_data[weather_data$temp > -100,]
+  weather_data$visibility[weather_data$visibility <0] <- mean(weather_data$visibility)
+  # remove the winter break
+  weather_data <- weather_data[weather_data$start_date < '2011-12-01' | weather_data$start_date > '2012-03-15',]
   
   # remove spaces from column names (this was for use in formulas later, but never panned out)
   old_levels <- levels(weather_data$conditions)
@@ -214,7 +222,7 @@ time_of_day_analysis <- function(trips, stations) {
 }
 
 # merge the weather data frame with the trips data frame
-merge_weather_trips <- function(trips, weather, allx_flag = TRUE) {
+sum_trips_merge_weather <- function(trips, weather, allx_flag = TRUE) {
   # get sum of all trips every hour
   trips_per_hour <- trips[, list(sum_trips = .N), by = c( 'start_hour', 'start_date')] # total trips per hour
   
@@ -225,7 +233,49 @@ merge_weather_trips <- function(trips, weather, allx_flag = TRUE) {
   trips_per_hour$conditions <- factor(trips_per_hour$conditions) # lost some ice and snow conditions since no one rode then
   trips_per_hour$start_hour <- as.factor(trips_per_hour$start_hour)
   
+  # re-add the weekday info
+  trips_per_hour$day_of_week <- weekdays(trips_per_hour$start_date)
+  trips_per_hour$weekend <- as.factor(grepl("Sat|Sun", trips_per_hour$day_of_week))
+  levels(trips_per_hour$weekend) <- c('Workday', 'Weekend')
+  
   return(trips_per_hour)
+}
+
+# Taken from cookbook for R, http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_%28ggplot2%29/
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
 }
 
 if(interactive()) {
@@ -255,15 +305,22 @@ if(interactive()) {
   ## How does weather influence bike rides?
   # first, let's see distribution of trips per hour, since that is dependent variable
   loginfo('Merging weather and trip data')
-  trips_per_hour_all <- merge_weather_trips(trips, weather, allx_flag = TRUE)
+  trips_per_hour_all <- sum_trips_merge_weather(trips, weather, allx_flag = TRUE)
   
   # let's explore by plotting average trips per hour in select conditions
   loginfo('Plotting mean trips / hour under various conditions')
   trips_by_condition <- trips_per_hour_all[, list(mean_trips = mean(sum_trips)), by =c('start_hour', 'conditions')]
-  conditions_per_hour_plot <- qplot(start_hour, mean_trips, data = trips_by_condition[conditions %in% c('Clear', 'Overcast','Rain', 'Light Snow')],
+  conditions_per_hour_plot <- qplot(start_hour, mean_trips, data = trips_by_condition[conditions %in% c('Clear', 'Overcast','Rain', 'Light_Snow')],
                                     color = conditions) + geom_point(size=5) + xlab('Hour') + ylab('Mean trips / hour')
   conditions_per_hour_plot + theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 16),
                                    axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 18))
+  
+  # plot trips for weekend vs workweek
+  trips_by_weekend <- trips_per_hour_all[, list(mean_trips = mean(sum_trips)), by =c('start_hour', 'weekend')]
+  weekend_plot <- qplot(start_hour, mean_trips, data = trips_by_weekend, color = weekend) + geom_point(size=5)
+  weekend_plot + xlab('Hour') + ylab('Mean trips / hour') + theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 16),
+                                                                  axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 18))
+  
   
   loginfo('Plotting distribution of dependent variable, the sum of trips / hour')
   par(mfrow=c(2,2))
@@ -275,7 +332,7 @@ if(interactive()) {
   
   # since I don't have tools to handle biased 0 distributions, let's take out zero times
   loginfo('Merging weather and trip data, ignoring 0 trip hours')
-  trips_per_hour <- merge_weather_trips(trips, weather, allx_flag = FALSE)
+  trips_per_hour <- sum_trips_merge_weather(trips, weather, allx_flag = FALSE)
   
   loginfo('Plotting distribution of dependent variable, the sum of trips / hour')
   par(mfrow=c(2,2))
@@ -297,7 +354,8 @@ if(interactive()) {
   
   ## Now let's model it:
   loginfo('Now, we fit the trips per hour over all the variables')
-  naive_conditions_model <- lm(sqrt(sum_trips) ~ . - start_date, data = trips_per_hour )
+  #naive_conditions_model <- lm(sqrt(sum_trips) ~ . - start_date - day_of_week, data = trips_per_hour_all )
+  naive_conditions_model <- lm(sqrt(sum_trips) ~ . - start_date - day_of_week + weekend*start_hour, data = trips_per_hour )
   print(summary(naive_conditions_model))
   loginfo(paste('There are a lot of significant variables! Overall, this model has an AIC of ',
                 as.character(AIC(naive_conditions_model))))
